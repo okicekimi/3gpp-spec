@@ -1,0 +1,227 @@
+name: Fetch, Convert and Index 3GPP Specs
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Download/conversion mode'
+        required: true
+        default: 'missing'
+        type: choice
+        options:
+          - all
+          - missing
+      ts_filter:
+        description: 'Optional: filter by TS number (e.g. 38.211), leave empty for all'
+        required: false
+        default: ''
+      rel_filter:
+        description: 'Optional: filter by version prefix (e.g. 18.), leave empty for all (only applies to download step)'
+        required: false
+        default: ''
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  fetch-convert-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────
+      # Step 1: Download PDFs into specs-pdf/
+      #   - reads urls_specs_download.md
+      #   - saves with renamed filename: ts_37_213_v1806.pdf
+      # ─────────────────────────────────────────
+      - name: Download PDFs
+        continue-on-error: true
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          TS_FILTER: ${{ github.event.inputs.ts_filter }}
+          REL_FILTER: ${{ github.event.inputs.rel_filter }}
+        run: |
+          SUCCESS=0
+          SKIP=0
+          FAIL=0
+          FAIL_LIST=""
+
+          cleaned=$(sed 's/\r//g; s/^\xEF\xBB\xBF//; s/^[[:space:]]*//; s/[[:space:]]*$//' urls_specs_download.md \
+                    | grep -v '^#' | grep -v '^$')
+
+          while IFS= read -r url; do
+            filename=$(basename "$url")
+
+            # Rename ETSI name -> short name:
+            #   ts_137213v180600p.pdf  ->  ts_37_213_v1806.pdf
+            #   (drop leading 1, split NN_NNN, version keep major+minor)
+            newname=$(echo "$filename" | sed -E 's/^ts_1([0-9]{2})([0-9]{3})v([0-9]{2})([0-9]{2})[0-9]{2}p\.pdf$/ts_\1_\2_v\3\4.pdf/')
+            save_path="specs-pdf/${newname}"
+
+            # TS_FILTER matches the ORIGINAL ETSI filename (137213 form)
+            if [ -n "$TS_FILTER" ]; then
+              ts_nodot="${TS_FILTER//./}"
+              ts_etsi="1${ts_nodot}"
+              if [[ "$filename" != *"${ts_etsi}"* ]]; then
+                continue
+              fi
+            fi
+
+            if [ -n "$REL_FILTER" ]; then
+              if [[ "$url" != *"/${REL_FILTER}"* ]]; then
+                continue
+              fi
+            fi
+
+            if [ "$MODE" = "missing" ] && [ -f "$save_path" ]; then
+              echo "SKIP (exists): $save_path"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            mkdir -p "$(dirname "$save_path")"
+            echo "Downloading: $url"
+            echo "       -> $save_path"
+
+            HTTP_CODE=$(curl -L --retry 3 --retry-delay 8 \
+              --connect-timeout 30 --max-time 180 \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: application/pdf,*/*" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -H "Referer: https://www.etsi.org/deliver/" \
+              -w "%{http_code}" -o "$save_path" \
+              "$url" 2>/dev/null)
+
+            if [ "$HTTP_CODE" = "200" ] && [ -s "$save_path" ]; then
+              SIZE=$(du -sh "$save_path" | cut -f1)
+              echo "  OK [$SIZE]"
+              SUCCESS=$((SUCCESS + 1))
+            else
+              echo "  FAIL (HTTP $HTTP_CODE)"
+              rm -f "$save_path"
+              FAIL=$((FAIL + 1))
+              FAIL_LIST="${FAIL_LIST}${url}"$'\n'
+            fi
+
+            sleep 2
+
+          done <<< "$cleaned"
+
+          echo ""
+          echo "===== Download Summary ====="
+          echo "Success : $SUCCESS"
+          echo "Skipped : $SKIP"
+          echo "Failed  : $FAIL"
+
+          if [ -n "$FAIL_LIST" ]; then
+            echo "$FAIL_LIST" > failed_downloads.txt
+            echo "Failed URLs written to failed_downloads.txt"
+          fi
+
+      # ─────────────────────────────────────────
+      # Step 2: Convert PDFs to Markdown
+      #   - files are already renamed (ts_37_213_v1806.pdf)
+      #   - TS_FILTER now matches the NEW name (37_213 form)
+      # ─────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y poppler-utils
+
+      - name: Convert PDFs to Markdown
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          TS_FILTER: ${{ github.event.inputs.ts_filter }}
+        run: |
+          mkdir -p specs-md
+
+          find specs-pdf -name "*.pdf" | sort | while read pdf_path; do
+            filename=$(basename "$pdf_path" .pdf)
+
+            # TS_FILTER matches the NEW filename (e.g. 38.211 -> 38_211)
+            if [ -n "$TS_FILTER" ]; then
+              ts_us="${TS_FILTER//./_}"
+              if [[ "$filename" != *"${ts_us}"* ]]; then
+                continue
+              fi
+            fi
+
+            md_path="specs-md/${filename}.md"
+
+            if [ "$MODE" = "missing" ] && [ -f "$md_path" ]; then
+              echo "SKIP (exists): $md_path"
+              continue
+            fi
+
+            echo "Converting: $pdf_path -> $md_path"
+
+            TMP_TXT=$(mktemp)
+            if pdftotext -layout "$pdf_path" "$TMP_TXT" 2>/dev/null; then
+              {
+                echo "---"
+                echo "source: $pdf_path"
+                echo "spec: $filename"
+                echo "converted: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                echo "---"
+                echo ""
+                echo "# $filename"
+                echo ""
+                cat "$TMP_TXT"
+              } > "$md_path"
+              echo "  OK ($(du -sh "$md_path" | cut -f1))"
+            else
+              echo "  FAIL: pdftotext error"
+            fi
+
+            rm -f "$TMP_TXT"
+          done
+
+          echo "Conversion complete."
+
+      # ─────────────────────────────────────────
+      # Step 3: Generate urls_specs_for_AI.md
+      # ─────────────────────────────────────────
+      - name: Generate urls_specs_for_AI.md
+        run: |
+          REPO="okicekimi/3gpp-specs"
+          BRANCH="main"
+          BASE_RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}/specs-md"
+
+          echo "# 3GPP Specs Raw URLs" > urls_specs_for_AI.md
+          echo "" >> urls_specs_for_AI.md
+          echo "Auto-generated on $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> urls_specs_for_AI.md
+          echo "" >> urls_specs_for_AI.md
+
+          for f in specs-md/*.md; do
+            [ -f "$f" ] || continue
+            filename=$(basename "$f")
+            encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${filename}'))")
+            echo "- [${filename}](${BASE_RAW}/${encoded})" >> urls_specs_for_AI.md
+          done
+
+      # ─────────────────────────────────────────
+      # Step 4: Commit and push everything
+      # ─────────────────────────────────────────
+      - name: Commit and push
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A specs-pdf/ || true
+          git add -A specs-md/ || true
+          git add urls_specs_for_AI.md || true
+          git add failed_downloads.txt 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            PDF_COUNT=$(git diff --cached --name-only | grep -c '\.pdf$' || true)
+            MD_COUNT=$(git diff --cached --name-only | grep -c '\.md$' || true)
+            git commit -m "chore: add ${PDF_COUNT} PDFs, ${MD_COUNT} Markdown files, update index [bot]"
+            git pull --rebase
+            git push
+          fi
